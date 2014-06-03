@@ -23,7 +23,7 @@ module_dirs = ['input',
                'cluster']
 
 # Expand the include path to our libs and modules.
-# TODO: Check for problems with similar named modules in 
+# TODO: Check for problems with similar named modules in
 # different module directories.
 pathname = os.path.abspath(__file__)
 pathname = pathname[:pathname.rfind("/")]
@@ -47,13 +47,13 @@ def hasLoop(node, stack=[]):
         return hasLoop(current_node, stack)
     return []
 
-class GambolPutty:
+class GambolPutty():
     """A stream parser with configurable modules and message paths.
-    
+
     GambolPutty helps to parse text based streams by providing a framework of modules.
     These modules can be combined via a simple configuration in any way you like. Have
     a look at the example config gambolputty.conf.example in the conf folder.
-    
+
     This is the main class that reads the configuration, includes the needed modules
     and connects them via queues as configured.
     """
@@ -61,6 +61,7 @@ class GambolPutty:
     def __init__(self, path_to_config_file=False):
         self.alive = False
         self.main_process_pid = os.getpid()
+        self.is_master = True
         self.modules = {}
         self.logger = logging.getLogger(self.__class__.__name__)
         if path_to_config_file:
@@ -204,7 +205,7 @@ class GambolPutty:
 
     def initEventStream(self):
         """ Connect modules.
-        
+
         The configuration allows to connect the modules via the <receivers> parameter.
         This method creates the queues and connects the modules via this queues.
         To prevent loops a sanity check is performed before all modules are connected.
@@ -258,7 +259,7 @@ class GambolPutty:
                     else:
                         instance.addReceiver(receiver_name, receiver_instance)
         # Check if the configuration produces a loop.
-        # This code can definitely be made more efficient...  
+        # This code can definitely be made more efficient...
         for node in module_loop_buffer:
             for loop in hasLoop(node, stack=[]):
                 self.logger.error(
@@ -280,9 +281,11 @@ class GambolPutty:
         # All modules are completely configured, call modules run method if it exists.
         for module_name, module_info in sorted(self.modules.items(), key=lambda x: x[1]['idx']):
             if len(module_info['instances']) > 1 and module_info['instances'][0].can_run_parallel:
-                self.logger.info("%sUsing module %s, pool size: %s%s." % (Utils.AnsiColors.LIGHTBLUE, module_name, len(module_info['instances']), Utils.AnsiColors.ENDC))
+                start_message = "%sUsing module %s, pool size: %s%s." % (Utils.AnsiColors.LIGHTBLUE, module_name, len(module_info['instances']), Utils.AnsiColors.ENDC)
             else:
-                self.logger.info("%sUsing module %s%s." % (Utils.AnsiColors.LIGHTBLUE, module_name, Utils.AnsiColors.ENDC))
+                start_message = "%sUsing module %s%s." % (Utils.AnsiColors.LIGHTBLUE, module_name, Utils.AnsiColors.ENDC)
+            if self.is_master:
+                self.logger.info(start_message)
             for instance in module_info['instances']:
                 name = module_info['id'] if 'id' in module_info else module_name
                 try:
@@ -290,33 +293,51 @@ class GambolPutty:
                         # The default 'start' method of threading.Thread will call the 'run' method of the module.
                         instance.start()
                     elif getattr(instance, "run", None):
-                        # Call 'run' method directly.
                         instance.run()
                 except:
                     etype, evalue, etb = sys.exc_info()
                     self.logger.warning("%sError calling run/start method of %s. Exception: %s, Error: %s.%s" % (Utils.AnsiColors.WARNING, name, etype, evalue, Utils.AnsiColors.ENDC))
                 if not instance.can_run_parallel:
                     break
-        import tornado.ioloop
-        tornado.ioloop.IOLoop.instance().start()
+
+    def runChildren(self, family_count=0):
+        self.children = []
+        print "runChildren method called in %s" % os.getpid()
+        if family_count == 0 or family_count > multiprocessing.cpu_count():
+            family_count = multiprocessing.cpu_count() - 1
+        for i in range(family_count):
+            pid = os.fork()
+            if pid == 0:
+                #print "Childprocess %s" % os.getpid()
+                self.is_master = False
+                self.run()
+                break
+            #print "forked pid %s" % pid
+            self.children.append(pid)
+        self.run()
 
     def run(self):
         self.alive = True
+        print "Run method called in %s" % os.getpid()
         # Catch Keyboard interrupt here. Catching the signal seems
         # to be more reliable then using try/except when running
         # multiple processes under pypy.
         signal.signal(signal.SIGINT, self.shutDown)
         signal.signal(signal.SIGALRM, self.restart)
         self.runModules()
-        while self.alive:
-            time.sleep(.5)
+        if self.is_master:
+            self.logger.info("%sGambolPutty started with %s processes.%s" % (Utils.AnsiColors.LIGHTBLUE, len(self.children)+1, Utils.AnsiColors.ENDC))
+        import tornado.ioloop
+        tornado.ioloop.IOLoop.instance().start()
+        #while self.alive:
+        #    time.sleep(.5)
 
     def restart(self, signum=False, frame=False):
         # If a module started a subprocess, the whole gambolputty parent process gets forked.
         # As a result, the forked gambolputty process will also catch SIGINT||SIGALARM.
         # Still we know the pid of the original main process.
         is_forked_process = self.main_process_pid != os.getpid()
-        if not is_forked_process:
+        if self.is_master:
             self.logger.info("%sRestarting GambolPutty.%s" % (Utils.AnsiColors.LIGHTBLUE, Utils.AnsiColors.ENDC))
         self.shutDownModules()
         self.configure()
@@ -329,16 +350,16 @@ class GambolPutty:
         # If a module started a subprocess, the whole gambolputty parent process gets forked.
         # As a result, the forked gambolputty process will also catch SIGINT||SIGALARM.
         # Still we know the pid of the original main process and ignore SIGINT||SIGALARM in forked processes.
-        if self.main_process_pid != os.getpid():
-            return
         # Directly exit on a second SIGINT||SIGALARM.
         if not self.alive:
             sys.exit(0)
         self.alive = False
-        self.logger.info("%sShutting down GambolPutty.%s" % (Utils.AnsiColors.LIGHTBLUE, Utils.AnsiColors.ENDC))
+        if self.is_master:
+            self.logger.info("%sShutting down GambolPutty.%s" % (Utils.AnsiColors.LIGHTBLUE, Utils.AnsiColors.ENDC))
         self.shutDownModules()
         Utils.TimedFunctionManager.stopTimedFunctions()
-        self.logger.info("%sShutdown complete.%s" % (Utils.AnsiColors.LIGHTBLUE, Utils.AnsiColors.ENDC))
+        if self.is_master:
+            self.logger.info("%sShutdown complete.%s" % (Utils.AnsiColors.LIGHTBLUE, Utils.AnsiColors.ENDC))
         sys.exit(0)
 
     def shutDownModules(self):
@@ -367,14 +388,14 @@ class GambolPutty:
                     events_in_queues += queue.qsize()
                 if events_in_queues > 0:
                     # Give remaining queued events some time to finish.
-                    if self.main_process_pid == os.getpid():
+                    if self.is_master == os.getpid():
                         self.logger.info("%s%s event(s) still in flight. Waiting %s secs. Press ctrl+c again to exit directly.%s" % (Utils.AnsiColors.LIGHTBLUE, events_in_queues, (.5 * wait_loops),Utils.AnsiColors.ENDC))
                     time.sleep(.5 * wait_loops)
                     continue
                 break
         # Shutdown all other modules.
         for module_name, module_info in self.modules.iteritems():
-            silent=False
+            silent = not self.is_master
             for instance in module_info['instances']:
                 if instance.module_type != "input":
                     instance.shutDown(silent)
@@ -419,7 +440,4 @@ if "__main__" == __name__:
     if run_configtest:
         logger.info("%sConfigurationtest for %s finished.%s" % (Utils.AnsiColors.LIGHTBLUE, path_to_config_file, Utils.AnsiColors.ENDC))
         sys.exit(0)
-    gp.run()
-
-
-
+    gp.runChildren()
