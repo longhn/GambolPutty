@@ -37,6 +37,8 @@ class SimpleStats(BaseModule.BaseModule):
         return runTimedFunctionsFunc
 
     def printIntervalStatistics(self):
+        if not self.gp.is_master:
+            return
         self.logger.info("############# Statistics #############")
         if self.getConfigurationValue('receive_rate_statistics'):
             self.receiveRateStatistics()
